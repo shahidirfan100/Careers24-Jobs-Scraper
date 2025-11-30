@@ -63,22 +63,43 @@ const normalizeText = (str) => {
     return String(str).replace(/\s+/g, ' ').trim() || null;
 };
 
-// Extract text from a container but **only** from textual tags
-// (no scripts, no random divs, no ads)
+const basicCleanText = (htmlOrText) => {
+    if (!htmlOrText) return '';
+    const $ = cheerioLoad(htmlOrText);
+    $('script, style, noscript, iframe').remove();
+    return $.root().text().replace(/\s+/g, ' ').trim();
+};
+
+// Extract text/HTML from a container but **only** from textual tags,
+// and drop obvious non-content sections (share buttons, meta, similar jobs).
 const extractTextualContent = ($, $root) => {
     if (!$root || !$root.length) return { html: null, text: null };
 
-    // Remove obvious junk *inside* the root
+    // 1) Remove obvious junk inside the root
     $root.find(
         'script, style, noscript, iframe, form, button,' +
             '.social-share, .share, .share-buttons, .breadcrumbs, .breadcrumb,' +
             '.ad-container, .advert, .advertisement, .adsbygoogle,' +
-            '#adcontainer1, [id^="div-gpt-ad"], .job-actions, .job-header-tools',
+            '#adcontainer1, [id^="div-gpt-ad"], .job-actions, .job-header-tools,' +
+            '.vacancy-detail-head, .icon-list, .social-media, .social-media-desktop, .social-media-mobile'
     ).remove();
 
-    // Collect only real content tags
+    // 2) Remove "Similar Jobs" / "More Jobs" blocks from inside this root
+    $root.find('h1, h2, h3').each((_, el) => {
+        const t = $(el).text().trim();
+        if (/^Similar Jobs$/i.test(t) || /^More Jobs/i.test(t)) {
+            // Remove this heading and everything that follows it inside the root
+            let current = $(el);
+            // Remove siblings after heading in the same parent
+            current.nextAll().remove();
+            // Remove the heading itself
+            current.remove();
+        }
+    });
+
+    // 3) Collect only real content tags
     const nodes = $root.find(
-        'h1, h2, h3, h4, h5, h6, p, ul, ol, li, strong, em, b, i',
+        'h1, h2, h3, h4, h5, h6, p, ul, ol, li, strong, em, b, i'
     ).toArray();
 
     if (!nodes.length) return { html: null, text: null };
@@ -188,7 +209,7 @@ function findNextPage($, base, currentPage) {
     return candidate;
 }
 
-// Extract meta: Location / Salary / Job Type / Sectors / Reference / Job ID
+// Extract meta: Location / Salary / Job Type / Sectors / Job ID
 function extractMetaFromSummary($) {
     const meta = {};
     const block = $('.job-summary, .job-details, .job-info, .job-summary-list, .job-meta').first();
@@ -282,14 +303,14 @@ function extractSectorsFromScripts($) {
     return sector;
 }
 
-// Extract numeric job ID from URL like /jobs/adverts/160997-some-title/
+// Extract numeric job ID from URL like /jobs/adverts/2324757-service-ambassador-johannesburg/
 function extractJobIdFromUrl(jobUrl) {
     try {
         const u = new URL(jobUrl);
         const parts = u.pathname.split('/').filter(Boolean);
         const advertsIndex = parts.indexOf('adverts');
         if (advertsIndex !== -1 && parts[advertsIndex + 1]) {
-            const slug = parts[advertsIndex + 1]; // "160997-job-title"
+            const slug = parts[advertsIndex + 1]; // "2324757-service-ambassador-johannesburg"
             const match = slug.match(/\d+/);
             return match ? match[0] : null;
         }
@@ -508,9 +529,16 @@ await Actor.main(async () => {
                             null;
                     }
 
-                    // Job description container(s)
-                    let descRoot =
-                        $('[itemprop="description"], .job-description, .job-details__description, .description, #job-description, .job-description-section, .jobDetails').first();
+                    // Job description root: aim at "Vacancy Details" area first
+                    let descRoot = $('h1:contains("Vacancy Details")')
+                        .first()
+                        .closest('section, div, article');
+
+                    if (!descRoot || !descRoot.length) {
+                        descRoot = $(
+                            '[itemprop="description"], .job-description, .job-details__description, .description, #job-description, .job-description-section, .jobDetails'
+                        ).first();
+                    }
 
                     if (!descRoot || !descRoot.length) {
                         // Broader fallback
@@ -521,21 +549,27 @@ await Actor.main(async () => {
                     let description_html = null;
                     let description_text = null;
 
+                    // If JSON-LD description exists, run it through textual filter too
                     if (data.description_html) {
-                        // JSON-LD description: still run through clean textual extractor
-                        const $tmpRoot = cheerioLoad(`<div id="__desc_root">${data.description_html}</div>`);
-                        const { html, text } = extractTextualContent($tmpRoot, $tmpRoot('#__desc_root'));
+                        const $tmpRoot = cheerioLoad(
+                            `<div id="__desc_root">${data.description_html}</div>`
+                        );
+                        const { html, text } = extractTextualContent(
+                            $tmpRoot,
+                            $tmpRoot('#__desc_root'),
+                        );
                         description_html = html;
                         description_text = text;
                     }
 
+                    // If still empty, use the actual DOM
                     if (!description_text) {
                         const { html, text } = extractTextualContent($, descRoot);
                         description_html = html;
                         description_text = text;
                     }
 
-                    // If still too short, try a wider textual-only fallback, but avoid whole-page junk
+                    // As final fallback for short descriptions, broaden slightly
                     if (!description_text || description_text.length < 300) {
                         const broadRoot = $('.job-view, .job-details-page, article.job, .job-content')
                             .first();
@@ -604,11 +638,27 @@ await Actor.main(async () => {
                         data.date_posted = dateText || null;
                     }
 
-                    // Company description - clean text textual-only
+                    // Company description - "About ..." or company profile area
                     let company_description = null;
-                    const companyRoot = $(
-                        '.company-description, .about-company, #company-profile, .about-company-section, .company-profile',
+                    let companyRoot = $(
+                        '.company-description, .about-company, #company-profile, .about-company-section, .company-profile'
                     ).first();
+
+                    if (!companyRoot || !companyRoot.length) {
+                        const aboutHeading = $('h1, h2')
+                            .filter((_, el) => {
+                                const t = $(el).text().trim().toLowerCase();
+                                return t.startsWith('about ');
+                            })
+                            .first();
+                        if (aboutHeading && aboutHeading.length) {
+                            companyRoot = aboutHeading.closest('section, div, article');
+                            if (!companyRoot || !companyRoot.length) {
+                                companyRoot = aboutHeading.parent();
+                            }
+                        }
+                    }
+
                     if (companyRoot && companyRoot.length) {
                         const { text } = extractTextualContent($, companyRoot);
                         company_description = text || null;
@@ -633,7 +683,7 @@ await Actor.main(async () => {
                     };
 
                     const item = {
-                        schema_version: 4,
+                        schema_version: 5,
                         source: 'careers24',
                         scraped_at: new Date().toISOString(),
 
@@ -654,7 +704,6 @@ await Actor.main(async () => {
                         // Descriptions
                         description_html: description_html || null,
                         description_text: description_text || null,
-                        job_description: description_text || null, // alias
 
                         company_description: company_description || null,
 
