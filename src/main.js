@@ -1,5 +1,5 @@
 // Careers24 jobs scraper - CheerioCrawler implementation
-// Stealthy, production-grade, with clean description_html/description_text,
+// Stealthy, production-grade, with clean description_html / description_text,
 // sectors, single job_id column, and clean company_description.
 
 import { Actor, log } from 'apify';
@@ -70,50 +70,87 @@ const basicCleanText = (htmlOrText) => {
     return $.root().text().replace(/\s+/g, ' ').trim();
 };
 
-// Extract text/HTML from a container but **only** from textual tags,
-// and drop obvious non-content sections (share buttons, meta, similar jobs).
-const extractTextualContent = ($, $root) => {
-    if (!$root || !$root.length) return { html: null, text: null };
+// Serialize a subtree into HTML containing only "text-related tags":
+// h1–h6, p, ul, ol, li, strong, em, b, i
+// with NO attributes (no classes / ids / style).
+const ALLOWED_TAGS = new Set([
+    'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+    'p', 'ul', 'ol', 'li',
+    'strong', 'em', 'b', 'i',
+]);
 
-    // 1) Remove obvious junk inside the root
-    $root.find(
+const sanitizeSubtreeToHtml = ($local, rootNode) => {
+    const walk = (node) => {
+        let out = '';
+
+        $local(node)
+            .contents()
+            .each((_, child) => {
+                if (child.type === 'text') {
+                    out += child.data;
+                } else if (child.type === 'tag') {
+                    const tag = child.name.toLowerCase();
+                    if (ALLOWED_TAGS.has(tag)) {
+                        const inner = walk(child);
+                        out += `<${tag}>${inner}</${tag}>`;
+                    } else {
+                        // Skip non-allowed tag but still walk its children
+                        out += walk(child);
+                    }
+                }
+            });
+
+        return out;
+    };
+
+    return walk(rootNode) || '';
+};
+
+// Given raw HTML of a "content root",
+// 1) removes junk (share, meta chips, similar jobs, ads, social).
+// 2) serializes only text-related tags (no attributes).
+// 3) returns { html, text }.
+const extractSanitizedContent = (rootHtml) => {
+    if (!rootHtml) return { html: null, text: null };
+
+    const $local = cheerioLoad(`<root>${rootHtml}</root>`);
+    const root = $local('root').first();
+
+    // Remove obvious junk
+    root.find(
         'script, style, noscript, iframe, form, button,' +
-            '.social-share, .share, .share-buttons, .breadcrumbs, .breadcrumb,' +
+            '.vacancy-detail-head, .icon-list, .small-text.icon-list,' +
+            '.social-media, .social-media-desktop, .social-media-mobile,' +
+            '.share, .share-buttons, .breadcrumbs, .breadcrumb,' +
             '.ad-container, .advert, .advertisement, .adsbygoogle,' +
-            '#adcontainer1, [id^="div-gpt-ad"], .job-actions, .job-header-tools,' +
-            '.vacancy-detail-head, .icon-list, .social-media, .social-media-desktop, .social-media-mobile'
+            '#adcontainer1, [id^="div-gpt-ad"], .job-actions, .job-header-tools'
     ).remove();
 
-    // 2) Remove "Similar Jobs" / "More Jobs" blocks from inside this root
-    $root.find('h1, h2, h3').each((_, el) => {
-        const t = $(el).text().trim();
-        if (/^Similar Jobs$/i.test(t) || /^More Jobs/i.test(t)) {
-            // Remove this heading and everything that follows it inside the root
-            let current = $(el);
-            // Remove siblings after heading in the same parent
-            current.nextAll().remove();
-            // Remove the heading itself
-            current.remove();
+    // Remove "Share This Vacancy" modal titles/containers
+    root.find('h4').each((_, el) => {
+        const t = $local(el).text().trim();
+        if (/^Share This Vacancy$/i.test(t)) {
+            $local(el).closest('div, section, header').remove();
         }
     });
 
-    // 3) Collect only real content tags
-    const nodes = $root.find(
-        'h1, h2, h3, h4, h5, h6, p, ul, ol, li, strong, em, b, i'
-    ).toArray();
+    // Remove "Similar Jobs" / "More Jobs" sections
+    root.find('h1, h2, h3').each((_, el) => {
+        const t = $local(el).text().trim();
+        if (/^Similar Jobs$/i.test(t) || /^More Jobs/i.test(t)) {
+            const parent = $local(el).closest('section, div, article');
+            if (parent.length) parent.remove();
+            else $local(el).remove();
+        }
+    });
 
-    if (!nodes.length) return { html: null, text: null };
-
-    const partsHtml = nodes.map((el) => $.html(el)).join('\n');
-    const partsText = nodes
-        .map((el) => $(el).text())
-        .join(' ')
-        .replace(/\s+/g, ' ')
-        .trim();
+    // Now serialize only allowed tags without attributes
+    const html = sanitizeSubtreeToHtml($local, root[0]);
+    const text = basicCleanText(html);
 
     return {
-        html: partsHtml || null,
-        text: partsText || null,
+        html: html || null,
+        text: text || null,
     };
 };
 
@@ -320,6 +357,30 @@ function extractJobIdFromUrl(jobUrl) {
         return null;
     }
 }
+
+// Heuristic: detect generic Careers24 text and avoid using it as company_description.
+const isProbablyGenericCareers24Text = (text, companyName) => {
+    if (!text) return true; // treat empty as "not valid"
+
+    const t = text.toLowerCase().trim();
+    const len = t.length;
+    const companyLower = (companyName || '').toLowerCase().trim();
+
+    // Very short text is likely not a real company profile
+    if (len < 60) return true;
+
+    // If text heavily mentions Careers24 but not the company name, it's likely generic Careers24 copy
+    const mentionsCareers24 = t.includes('careers24');
+    const mentionsCompany = companyLower && t.includes(companyLower);
+
+    if (mentionsCareers24 && !mentionsCompany) return true;
+
+    // Generic phrases we want to avoid
+    if (t.includes('browse jobs') || t.includes('search for jobs')) return true;
+    if (t.includes('post your cv') || t.includes('cv upload')) return true;
+
+    return false;
+};
 
 // ───────────────────────────────────────────────────────────────
 // MAIN (Actor.main)
@@ -529,58 +590,60 @@ await Actor.main(async () => {
                             null;
                     }
 
-                    // Job description root: aim at "Vacancy Details" area first
-                    let descRoot = $('h1:contains("Vacancy Details")')
-                        .first()
-                        .closest('section, div, article');
+                    // ── Job description root ─────────────────────────────
+                    let descRoot = $('.row.c24-vacancy-details').first();
+
+                    // Narrow to the column that contains "Vacancy Details" heading if available
+                    const vdHeading = $('h1, h2')
+                        .filter((_, el) => $(el).text().trim() === 'Vacancy Details')
+                        .first();
+                    if (vdHeading.length) {
+                        const col = vdHeading.closest('section, div, article');
+                        if (col.length) descRoot = col;
+                    }
 
                     if (!descRoot || !descRoot.length) {
                         descRoot = $(
-                            '[itemprop="description"], .job-description, .job-details__description, .description, #job-description, .job-description-section, .jobDetails'
+                            '[itemprop="description"], .job-description, .job-details__description, .description, #job-description, .job-description-section, .jobDetails',
                         ).first();
                     }
 
                     if (!descRoot || !descRoot.length) {
-                        // Broader fallback
-                        descRoot = $('.job-view, .job-details-page, article.job, .job-content, main')
-                            .first();
+                        descRoot = $('.job-view, .job-details-page, article.job, .job-content, main').first();
                     }
 
                     let description_html = null;
                     let description_text = null;
 
-                    // If JSON-LD description exists, run it through textual filter too
-                    if (data.description_html) {
-                        const $tmpRoot = cheerioLoad(
-                            `<div id="__desc_root">${data.description_html}</div>`
-                        );
-                        const { html, text } = extractTextualContent(
-                            $tmpRoot,
-                            $tmpRoot('#__desc_root'),
-                        );
+                    // Prefer DOM over JSON-LD for precise control, but still use JSON-LD if DOM missing
+                    if (descRoot && descRoot.length) {
+                        const { html, text } = extractSanitizedContent(descRoot.html() || '');
                         description_html = html;
                         description_text = text;
                     }
 
-                    // If still empty, use the actual DOM
-                    if (!description_text) {
-                        const { html, text } = extractTextualContent($, descRoot);
-                        description_html = html;
-                        description_text = text;
-                    }
-
-                    // As final fallback for short descriptions, broaden slightly
-                    if (!description_text || description_text.length < 300) {
-                        const broadRoot = $('.job-view, .job-details-page, article.job, .job-content')
-                            .first();
-                        const { html, text } = extractTextualContent($, broadRoot);
+                    if ((!description_text || description_text.length < 200) && data.description_html) {
+                        const { html, text } = extractSanitizedContent(data.description_html);
                         if (text && text.length > (description_text || '').length) {
                             description_html = html;
                             description_text = text;
                         }
                     }
 
-                    // Meta block for Durban / Salary / Job Type / Sectors / Job ID
+                    // As final fallback for short descriptions, slightly broaden
+                    if (!description_text || description_text.length < 200) {
+                        const broadRoot = $('.job-view, .job-details-page, article.job, .job-content')
+                            .first();
+                        if (broadRoot && broadRoot.length) {
+                            const { html, text } = extractSanitizedContent(broadRoot.html() || '');
+                            if (text && text.length > (description_text || '').length) {
+                                description_html = html;
+                                description_text = text;
+                            }
+                        }
+                    }
+
+                    // ── Meta block: location / salary / job type / sectors / job_id ────────────
                     const summaryMeta = extractMetaFromSummary($);
                     if (!data.location && summaryMeta.location) {
                         data.location = summaryMeta.location;
@@ -601,7 +664,7 @@ await Actor.main(async () => {
 
                     let jobIdMeta = summaryMeta.job_id || null;
 
-                    // Fallbacks directly from selectors
+                    // Fallbacks from selectors
                     if (!data.location) {
                         data.location =
                             $('[itemprop="jobLocation"], .job-location, .location')
@@ -638,11 +701,9 @@ await Actor.main(async () => {
                         data.date_posted = dateText || null;
                     }
 
-                    // Company description - "About ..." or company profile area
+                    // ── Company description: .c24-vacancy-details-contents then "About ..." ─────
                     let company_description = null;
-                    let companyRoot = $(
-                        '.company-description, .about-company, #company-profile, .about-company-section, .company-profile'
-                    ).first();
+                    let companyRoot = $('.c24-vacancy-details-contents').first();
 
                     if (!companyRoot || !companyRoot.length) {
                         const aboutHeading = $('h1, h2')
@@ -660,8 +721,17 @@ await Actor.main(async () => {
                     }
 
                     if (companyRoot && companyRoot.length) {
-                        const { text } = extractTextualContent($, companyRoot);
+                        const { text } = extractSanitizedContent(companyRoot.html() || '');
                         company_description = text || null;
+                    }
+
+                    // Apply heuristic: if text looks generic Careers24 (not about company), drop it
+                    if (company_description) {
+                        const companyNameForCheck =
+                            data.company || $('title').first().text().split('at ')[1] || '';
+                        if (isProbablyGenericCareers24Text(company_description, companyNameForCheck)) {
+                            company_description = null;
+                        }
                     }
 
                     // Job ID: meta -> URL
@@ -683,7 +753,7 @@ await Actor.main(async () => {
                     };
 
                     const item = {
-                        schema_version: 5,
+                        schema_version: 7,
                         source: 'careers24',
                         scraped_at: new Date().toISOString(),
 
@@ -702,10 +772,10 @@ await Actor.main(async () => {
                         sectors: normalized.sectors || sectorFromInput || null,
 
                         // Descriptions
-                        description_html: description_html || null,
+                        description_html: description_html || null,  // only clean text tags, no attributes
                         description_text: description_text || null,
 
-                        company_description: company_description || null,
+                        company_description: company_description || null, // clean text only, empty if generic Careers24
 
                         url: request.url,
                     };
