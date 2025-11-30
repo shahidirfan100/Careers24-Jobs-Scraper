@@ -1,17 +1,53 @@
-// Careers24 jobs scraper - CheerioCrawler implementation (enhanced)
-import { Actor, log } from 'apify';
+// Careers24 jobs scraper - CheerioCrawler implementation
+// Stealthy, production-grade, with full descriptions, sectors, job_id and clean-text company_description.
+
+import { Actor, log, sleep } from 'apify';
 import { CheerioCrawler, Dataset } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
 
-// --- Simple desktop User-Agent pool for stealth ---
-const USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
+// ───────────────────────────────────────────────────────────────
+// Stealth browser profiles (simulated latest desktop browsers - Nov 2025)
+// ───────────────────────────────────────────────────────────────
+
+const BROWSER_PROFILES = [
+    {
+        // Chrome 131 on Windows 11
+        ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        secChUa: '"Google Chrome";v="131", "Not=A?Brand";v="99", "Chromium";v="131"',
+        secChUaMobile: '?0',
+        secChUaPlatform: '"Windows"',
+    },
+    {
+        // Chrome 131 on macOS 14
+        ua: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        secChUa: '"Google Chrome";v="131", "Not=A?Brand";v="99", "Chromium";v="131"',
+        secChUaMobile: '?0',
+        secChUaPlatform: '"macOS"',
+    },
+    {
+        // Edge 130 on Windows 11
+        ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0',
+        secChUa: '"Microsoft Edge";v="130", "Chromium";v="130", "Not=A?Brand";v="99"',
+        secChUaMobile: '?0',
+        secChUaPlatform: '"Windows"',
+    },
+    {
+        // Firefox 131 on Linux
+        ua: 'Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0',
+        secChUa: '"Firefox";v="131", "Not=A?Brand";v="99"',
+        secChUaMobile: '?0',
+        secChUaPlatform: '"Linux"',
+    },
 ];
 
-const randomDesktopUA = () => USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+const pickBrowserProfile = () =>
+    BROWSER_PROFILES[Math.floor(Math.random() * BROWSER_PROFILES.length)];
+
+const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+const randomDelay = async (minMs, maxMs) => {
+    const delay = randomInt(minMs, maxMs);
+    await sleep(delay);
+};
 
 // Single-entrypoint main
 await Actor.init();
@@ -32,6 +68,9 @@ async function main() {
             proxyConfiguration,
             remoteOnly = false,
             minSalary = '',
+            // Optional knobs for tuning
+            maxConcurrency: INPUT_MAX_CONCURRENCY,
+            stealthDelays = true,
         } = input;
 
         const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW)
@@ -40,6 +79,11 @@ async function main() {
         const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW)
             ? Math.max(1, +MAX_PAGES_RAW)
             : 999;
+
+        // Lower concurrency for stealth, still fast enough
+        const MAX_CONCURRENCY = Number.isFinite(+INPUT_MAX_CONCURRENCY)
+            ? Math.max(1, +INPUT_MAX_CONCURRENCY)
+            : 5;
 
         const toAbs = (href, base = 'https://www.careers24.com') => {
             try {
@@ -54,9 +98,9 @@ async function main() {
             return String(str).replace(/\s+/g, ' ').trim() || null;
         };
 
-        const cleanText = (html) => {
-            if (!html) return '';
-            const $ = cheerioLoad(html);
+        const cleanText = (htmlOrText) => {
+            if (!htmlOrText) return '';
+            const $ = cheerioLoad(htmlOrText);
             $('script, style, noscript, iframe').remove();
             return $.root().text().replace(/\s+/g, ' ').trim();
         };
@@ -64,20 +108,17 @@ async function main() {
         const buildStartUrl = (kw, loc, sect, remOnly, minSal) => {
             let u = new URL('https://www.careers24.com/jobs/');
 
-            // Build path for location
             if (loc) {
                 const locSlug = String(loc).toLowerCase().replace(/\s+/g, '-');
                 u = new URL(`https://www.careers24.com/jobs/lc-${locSlug}/`);
             }
 
-            // Add remote filter to path
             if (remOnly) {
                 u.pathname += 'rmt-only/';
             } else {
                 u.pathname += 'rmt-incl/';
             }
 
-            // Add query parameters
             u.searchParams.set('sort', 'dateposted');
             if (kw) u.searchParams.set('q', String(kw).trim());
             if (sect) u.searchParams.set('sectors', String(sect).trim());
@@ -132,7 +173,7 @@ async function main() {
                         }
                     }
                 } catch (e) {
-                    /* ignore parsing errors */
+                    // ignore JSON-LD errors
                 }
             }
             return null;
@@ -140,7 +181,6 @@ async function main() {
 
         function findJobLinks($, base) {
             const links = new Set();
-            // Careers24 specific job link patterns
             $('a[href*="/jobs/adverts/"]').each((_, a) => {
                 const href = $(a).attr('href');
                 if (!href) return;
@@ -151,7 +191,6 @@ async function main() {
         }
 
         function findNextPage($, base, currentPage) {
-            // Careers24 uses page parameter
             const nextPageNum = currentPage + 1;
             const nextBtn = $('a')
                 .filter((_, el) => {
@@ -163,7 +202,6 @@ async function main() {
             const href = nextBtn.attr('href');
             if (href) return toAbs(href, base);
 
-            // Try to build next page URL manually
             const currentUrl = new URL(base);
             currentUrl.searchParams.set('page', String(nextPageNum));
             const candidate = currentUrl.href;
@@ -171,40 +209,42 @@ async function main() {
             return candidate;
         }
 
-        // Extract meta like Location / Salary / Job Type / Sectors / Reference from summary block
+        // Extract meta like Location / Salary / Job Type / Sectors / Reference / Job ID
         function extractMetaFromSummary($) {
             const meta = {};
-            const block = $('.job-summary, .job-details, .job-info, .job-summary-list').first();
+            const block = $('.job-summary, .job-details, .job-info, .job-summary-list, .job-meta').first();
             if (!block || !block.length) return meta;
 
-            block.find('li').each((_, li) => {
-                const $li = $(li);
-                let text = $li.text().replace(/\s+/g, ' ').trim();
+            const rows = block.find('li, tr, .job-meta-row, .job-summary-item');
+
+            rows.each((_, el) => {
+                const $el = $(el);
+                let text = $el.text().replace(/\s+/g, ' ').trim();
                 if (!text) return;
 
                 let label = '';
                 let value = '';
 
-                // Common pattern "Label: Value"
+                // Pattern "Label: Value"
                 const parts = text.split(':');
                 if (parts.length > 1) {
                     label = parts[0].trim().toLowerCase();
                     value = parts.slice(1).join(':').trim();
                 } else {
-                    // Try bold/strong label then rest as value
-                    const strong = $li.find('strong, b').first().text().trim();
+                    // dt/dd style or bold label
+                    const strong = $el.find('strong, b, dt').first().text().trim();
                     if (strong) {
                         label = strong.replace(/:$/, '').trim().toLowerCase();
-                        const clone = $li.clone();
-                        clone.find('strong, b').remove();
+                        const clone = $el.clone();
+                        clone.find('strong, b, dt').remove();
                         value = clone.text().replace(/\s+/g, ' ').trim();
                     }
                 }
 
                 if (!value) {
                     value =
-                        $li
-                            .find('span, .value')
+                        $el
+                            .find('span, .value, dd')
                             .last()
                             .text()
                             .replace(/\s+/g, ' ')
@@ -219,20 +259,32 @@ async function main() {
                         meta.location = value;
                         break;
                     case 'salary':
+                    case 'remuneration':
                         meta.salary = value;
                         break;
                     case 'job type':
                     case 'type':
+                    case 'employment type':
                         meta.employment_type = value;
                         break;
                     case 'sectors':
                     case 'sector':
+                    case 'industry':
+                    case 'industries':
+                    case 'category':
                         meta.sectors = value;
                         break;
                     case 'reference':
                     case 'ref':
                     case 'ref.':
+                    case 'job ref':
+                    case 'job reference':
                         meta.reference = value;
+                        meta.job_id = value;
+                        break;
+                    case 'job id':
+                    case 'id':
+                        meta.job_id = value;
                         break;
                     default:
                         break;
@@ -242,22 +294,98 @@ async function main() {
             return meta;
         }
 
+        // Extract numeric job ID from URL like /jobs/adverts/161114-some-title/
+        function extractJobIdFromUrl(jobUrl) {
+            try {
+                const u = new URL(jobUrl);
+                const parts = u.pathname.split('/').filter(Boolean);
+                const advertsIndex = parts.indexOf('adverts');
+                if (advertsIndex !== -1 && parts[advertsIndex + 1]) {
+                    const slug = parts[advertsIndex + 1]; // "161114-job-title"
+                    const match = slug.match(/\d+/);
+                    return match ? match[0] : null;
+                }
+                // fallback: search for any number group
+                const match = u.pathname.match(/(\d{4,})/);
+                return match ? match[1] : null;
+            } catch {
+                return null;
+            }
+        }
+
         const crawler = new CheerioCrawler({
             proxyConfiguration: proxyConf,
-            maxRequestRetries: 3,
+            maxRequestRetries: 5,
             useSessionPool: true,
-            maxConcurrency: 10,
+            sessionPoolOptions: {
+                maxPoolSize: 50,
+                sessionOptions: {
+                    maxUsageCount: 10,
+                    maxErrorScore: 3,
+                    errorScoreDecrement: 0.5,
+                },
+            },
+            minConcurrency: 1,
+            maxConcurrency: MAX_CONCURRENCY,
             requestHandlerTimeoutSecs: 60,
+
             preNavigationHooks: [
-                async ({ request }) => {
+                async ({ request, session }) => {
+                    const profile = pickBrowserProfile();
+
                     request.headers = {
                         ...(request.headers || {}),
-                        'User-Agent': randomDesktopUA(),
+                        'User-Agent': profile.ua,
                         'Accept-Language': 'en-US,en;q=0.9',
                         'Upgrade-Insecure-Requests': '1',
+                        Accept:
+                            'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                        'Sec-CH-UA': profile.secChUa,
+                        'Sec-CH-UA-Mobile': profile.secChUaMobile,
+                        'Sec-CH-UA-Platform': profile.secChUaPlatform,
+                        'Sec-Fetch-Dest': 'document',
+                        'Sec-Fetch-Mode': 'navigate',
+                        'Sec-Fetch-Site': 'none',
+                        'Sec-Fetch-User': '?1',
+                        'Cache-Control': 'no-cache',
                     };
+
+                    // Exponential backoff with jitter on retries
+                    if (request.retryCount > 0 && stealthDelays) {
+                        const base = 1000; // 1s
+                        const backoff = base * 2 ** (request.retryCount - 1);
+                        const jitter = randomInt(0, 500);
+                        await sleep(backoff + jitter);
+                    }
+
+                    // Network latency & human-like delay before requests
+                    if (stealthDelays) {
+                        const label = request.userData?.label || 'LIST';
+                        if (label === 'DETAIL') {
+                            await randomDelay(400, 1400);
+                        } else {
+                            await randomDelay(250, 900);
+                        }
+                    }
+
+                    if (session && profile.ua && !session.userData.browserUa) {
+                        session.userData.browserUa = profile.ua;
+                    }
                 },
             ],
+
+            postNavigationHooks: [
+                async ({ request }) => {
+                    if (!stealthDelays) return;
+                    const label = request.userData?.label || 'LIST';
+                    if (label === 'DETAIL') {
+                        await randomDelay(500, 2000);
+                    } else {
+                        await randomDelay(250, 1000);
+                    }
+                },
+            ],
+
             async requestHandler({ request, $, enqueueLinks, log: crawlerLog }) {
                 const label = request.userData?.label || 'LIST';
                 const pageNo = request.userData?.pageNo || 1;
@@ -321,11 +449,12 @@ async function main() {
 
                 if (label === 'DETAIL') {
                     if (saved >= RESULTS_WANTED) return;
+
                     try {
                         const json = extractFromJsonLd($);
                         const data = json || {};
 
-                        // Fallback selectors for Careers24 (title, company, description)
+                        // Title
                         if (!data.title) {
                             data.title =
                                 $('h1, .job-title, [itemprop="title"]')
@@ -334,6 +463,7 @@ async function main() {
                                     .trim() || null;
                         }
 
+                        // Company
                         if (!data.company) {
                             const companyEl = $(
                                 '[itemprop="hiringOrganization"], .company-name, a[href*="/now-hiring/"]',
@@ -345,19 +475,41 @@ async function main() {
                                 null;
                         }
 
+                        // Job description: try to get the largest relevant container
                         if (!data.description_html) {
-                            // Try several possible wrappers to capture the full job description content
-                            const desc = $(
+                            let desc = $(
                                 '[itemprop="description"], .job-description, .description, #job-description, .job-description-section, .jobDetails',
                             ).first();
+
+                            if (!desc || !desc.length) {
+                                // Fallback: surrounding main job content
+                                desc = $(
+                                    '.job-view, .job-details-page, main, article.job, .job-content',
+                                ).first();
+                            }
+
                             data.description_html =
                                 desc && desc.length ? String(desc.html()).trim() : null;
                         }
+
                         data.description_text = data.description_html
                             ? cleanText(data.description_html)
                             : null;
 
-                        // Meta block: location / salary / type / sectors / reference
+                        // If description looks suspiciously short, try a broader fallback
+                        if (!data.description_text || data.description_text.length < 400) {
+                            const broad = $(
+                                '.job-description, .job-view, .job-details-page, main, article.job, .job-content',
+                            )
+                                .first()
+                                .text();
+                            const broadText = cleanText(broad);
+                            if (broadText && broadText.length > (data.description_text || '').length) {
+                                data.description_text = broadText;
+                            }
+                        }
+
+                        // Meta block for Durban / Salary / Job Type / Sectors / Reference / Job ID
                         const summaryMeta = extractMetaFromSummary($);
                         if (!data.location && summaryMeta.location) {
                             data.location = summaryMeta.location;
@@ -374,8 +526,9 @@ async function main() {
                         if (summaryMeta.reference) {
                             data.reference = summaryMeta.reference;
                         }
+                        let jobIdMeta = summaryMeta.job_id || null;
 
-                        // Fallbacks directly from simple selectors if still missing
+                        // Fallbacks directly from selectors
                         if (!data.location) {
                             data.location =
                                 $('[itemprop="jobLocation"], .job-location, .location')
@@ -412,16 +565,18 @@ async function main() {
                             data.date_posted = dateText || null;
                         }
 
-                        // Company description / about company
-                        let company_description_html = null;
-                        let company_description_text = null;
+                        // Company description - clean text only
+                        let company_description = null;
                         const companyDescEl = $(
                             '.company-description, .about-company, #company-profile, .about-company-section, .company-profile',
                         ).first();
                         if (companyDescEl && companyDescEl.length) {
-                            company_description_html = String(companyDescEl.html()).trim();
-                            company_description_text = cleanText(company_description_html);
+                            company_description = cleanText(companyDescEl.html() || companyDescEl.text());
                         }
+
+                        // Job ID: meta -> URL
+                        const urlJobId = extractJobIdFromUrl(request.url);
+                        const job_id = jobIdMeta || urlJobId || null;
 
                         // Normalize core fields
                         const sectorFromInput = normalizeText(sector);
@@ -435,12 +590,14 @@ async function main() {
                             valid_through: normalizeText(data.valid_through),
                             sectors: normalizeText(data.sectors),
                             reference: normalizeText(data.reference),
+                            job_id: normalizeText(job_id),
                         };
 
                         const item = {
-                            schema_version: 2,
+                            schema_version: 3,
                             source: 'careers24',
                             scraped_at: new Date().toISOString(),
+
                             title: normalized.title,
                             company: normalized.company,
                             location: normalized.location,
@@ -448,12 +605,17 @@ async function main() {
                             job_type: normalized.employment_type,
                             date_posted: normalized.date_posted,
                             valid_through: normalized.valid_through,
+
+                            // Sectors and job ID
                             sectors: normalized.sectors || sectorFromInput || null,
-                            reference: normalized.reference || null,
-                            description_html: data.description_html || null,
+                            job_id: normalized.job_id || null,
+                            reference: normalized.reference || normalized.job_id || null,
+
+                            // Descriptions
                             description_text: data.description_text || null,
-                            company_description_html: company_description_html || null,
-                            company_description_text: company_description_text || null,
+                            job_description: data.description_text || null, // alias
+                            company_description: company_description || null, // clean text only
+
                             url: request.url,
                         };
 
@@ -466,6 +628,12 @@ async function main() {
                         crawlerLog.error(`DETAIL ${request.url} failed: ${err.message}`);
                     }
                 }
+            },
+
+            failedRequestHandler: async ({ request, log: crawlerLog }) => {
+                crawlerLog.warning(
+                    `Request ${request.url} failed too many times (retries: ${request.retryCount}).`,
+                );
             },
         });
 
