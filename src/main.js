@@ -2,7 +2,7 @@
 // Stealthy, production-grade, with full descriptions, sectors, job_id and clean-text company_description.
 
 import { Actor, log } from 'apify';
-import { CheerioCrawler, Dataset } from 'crawlee';
+import { CheerioCrawler, Dataset, sleep } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
 
 // ───────────────────────────────────────────────────────────────
@@ -46,7 +46,7 @@ const pickBrowserProfile = () =>
 const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 const randomDelay = async (minMs, maxMs) => {
     const delay = randomInt(minMs, maxMs);
-    await Actor.sleep(delay);
+    await sleep(delay);
 };
 
 const toAbs = (href, base = 'https://www.careers24.com') => {
@@ -351,7 +351,7 @@ await Actor.main(async () => {
                     const base = 1000; // 1s
                     const backoff = base * 2 ** (request.retryCount - 1);
                     const jitter = randomInt(0, 500);
-                    await Actor.sleep(backoff + jitter);
+                    await sleep(backoff + jitter);
                 }
 
                 // Network latency & human-like delay before requests
@@ -471,14 +471,14 @@ await Actor.main(async () => {
                             null;
                     }
 
-                    // Job description: try to get the largest relevant container
+                    // Job description: main container first
                     if (!data.description_html) {
                         let desc = $(
                             '[itemprop="description"], .job-description, .description, #job-description, .job-description-section, .jobDetails',
                         ).first();
 
                         if (!desc || !desc.length) {
-                            // Fallback: surrounding main job content
+                            // Fallback: broader main content container
                             desc = $(
                                 '.job-view, .job-details-page, main, article.job, .job-content',
                             ).first();
@@ -492,7 +492,7 @@ await Actor.main(async () => {
                         ? cleanText(data.description_html)
                         : null;
 
-                    // If description looks suspiciously short, try a broader fallback
+                    // If description looks suspiciously short, broaden
                     if (!data.description_text || data.description_text.length < 400) {
                         const broad = $(
                             '.job-description, .job-view, .job-details-page, main, article.job, .job-content',
