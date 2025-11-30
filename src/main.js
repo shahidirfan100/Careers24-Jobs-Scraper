@@ -1,5 +1,6 @@
 // Careers24 jobs scraper - CheerioCrawler implementation
-// Stealthy, production-grade, with full descriptions, sectors, job_id and clean-text company_description.
+// Stealthy, production-grade, with clean description_html/description_text,
+// sectors, single job_id column, and clean company_description.
 
 import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset, sleep } from 'crawlee';
@@ -62,11 +63,37 @@ const normalizeText = (str) => {
     return String(str).replace(/\s+/g, ' ').trim() || null;
 };
 
-const cleanText = (htmlOrText) => {
-    if (!htmlOrText) return '';
-    const $ = cheerioLoad(htmlOrText);
-    $('script, style, noscript, iframe').remove();
-    return $.root().text().replace(/\s+/g, ' ').trim();
+// Extract text from a container but **only** from textual tags
+// (no scripts, no random divs, no ads)
+const extractTextualContent = ($, $root) => {
+    if (!$root || !$root.length) return { html: null, text: null };
+
+    // Remove obvious junk *inside* the root
+    $root.find(
+        'script, style, noscript, iframe, form, button,' +
+            '.social-share, .share, .share-buttons, .breadcrumbs, .breadcrumb,' +
+            '.ad-container, .advert, .advertisement, .adsbygoogle,' +
+            '#adcontainer1, [id^="div-gpt-ad"], .job-actions, .job-header-tools',
+    ).remove();
+
+    // Collect only real content tags
+    const nodes = $root.find(
+        'h1, h2, h3, h4, h5, h6, p, ul, ol, li, strong, em, b, i',
+    ).toArray();
+
+    if (!nodes.length) return { html: null, text: null };
+
+    const partsHtml = nodes.map((el) => $.html(el)).join('\n');
+    const partsText = nodes
+        .map((el) => $(el).text())
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    return {
+        html: partsHtml || null,
+        text: partsText || null,
+    };
 };
 
 const buildStartUrl = (kw, loc, sect, remOnly, minSal) => {
@@ -161,7 +188,7 @@ function findNextPage($, base, currentPage) {
     return candidate;
 }
 
-// Extract meta like Location / Salary / Job Type / Sectors / Reference / Job ID
+// Extract meta: Location / Salary / Job Type / Sectors / Reference / Job ID
 function extractMetaFromSummary($) {
     const meta = {};
     const block = $('.job-summary, .job-details, .job-info, .job-summary-list, .job-meta').first();
@@ -229,9 +256,6 @@ function extractMetaFromSummary($) {
             case 'ref.':
             case 'job ref':
             case 'job reference':
-                meta.reference = value;
-                meta.job_id = value;
-                break;
             case 'job id':
             case 'id':
                 meta.job_id = value;
@@ -244,14 +268,28 @@ function extractMetaFromSummary($) {
     return meta;
 }
 
-// Extract numeric job ID from URL like /jobs/adverts/161114-some-title/
+// Fallback sectors from inline scripts (job_sector targeting)
+function extractSectorsFromScripts($) {
+    let sector = null;
+    $('script').each((_, el) => {
+        const txt = $(el).html() || '';
+        const m = txt.match(/job_sector'\s*,\s*\[\s*'([^']+)'/);
+        if (m && m[1]) {
+            sector = m[1];
+            return false; // break
+        }
+    });
+    return sector;
+}
+
+// Extract numeric job ID from URL like /jobs/adverts/160997-some-title/
 function extractJobIdFromUrl(jobUrl) {
     try {
         const u = new URL(jobUrl);
         const parts = u.pathname.split('/').filter(Boolean);
         const advertsIndex = parts.indexOf('adverts');
         if (advertsIndex !== -1 && parts[advertsIndex + 1]) {
-            const slug = parts[advertsIndex + 1]; // "161114-job-title"
+            const slug = parts[advertsIndex + 1]; // "160997-job-title"
             const match = slug.match(/\d+/);
             return match ? match[0] : null;
         }
@@ -281,7 +319,6 @@ await Actor.main(async () => {
         proxyConfiguration,
         remoteOnly = false,
         minSalary = '',
-        // Optional knobs for tuning
         maxConcurrency: INPUT_MAX_CONCURRENCY,
         stealthDelays = true,
     } = input;
@@ -471,41 +508,45 @@ await Actor.main(async () => {
                             null;
                     }
 
-                    // Job description: main container first
-                    if (!data.description_html) {
-                        let desc = $(
-                            '[itemprop="description"], .job-description, .description, #job-description, .job-description-section, .jobDetails',
-                        ).first();
+                    // Job description container(s)
+                    let descRoot =
+                        $('[itemprop="description"], .job-description, .job-details__description, .description, #job-description, .job-description-section, .jobDetails').first();
 
-                        if (!desc || !desc.length) {
-                            // Fallback: broader main content container
-                            desc = $(
-                                '.job-view, .job-details-page, main, article.job, .job-content',
-                            ).first();
-                        }
-
-                        data.description_html =
-                            desc && desc.length ? String(desc.html()).trim() : null;
+                    if (!descRoot || !descRoot.length) {
+                        // Broader fallback
+                        descRoot = $('.job-view, .job-details-page, article.job, .job-content, main')
+                            .first();
                     }
 
-                    data.description_text = data.description_html
-                        ? cleanText(data.description_html)
-                        : null;
+                    let description_html = null;
+                    let description_text = null;
 
-                    // If description looks suspiciously short, broaden
-                    if (!data.description_text || data.description_text.length < 400) {
-                        const broad = $(
-                            '.job-description, .job-view, .job-details-page, main, article.job, .job-content',
-                        )
-                            .first()
-                            .text();
-                        const broadText = cleanText(broad);
-                        if (broadText && broadText.length > (data.description_text || '').length) {
-                            data.description_text = broadText;
+                    if (data.description_html) {
+                        // JSON-LD description: still run through clean textual extractor
+                        const $tmpRoot = cheerioLoad(`<div id="__desc_root">${data.description_html}</div>`);
+                        const { html, text } = extractTextualContent($tmpRoot, $tmpRoot('#__desc_root'));
+                        description_html = html;
+                        description_text = text;
+                    }
+
+                    if (!description_text) {
+                        const { html, text } = extractTextualContent($, descRoot);
+                        description_html = html;
+                        description_text = text;
+                    }
+
+                    // If still too short, try a wider textual-only fallback, but avoid whole-page junk
+                    if (!description_text || description_text.length < 300) {
+                        const broadRoot = $('.job-view, .job-details-page, article.job, .job-content')
+                            .first();
+                        const { html, text } = extractTextualContent($, broadRoot);
+                        if (text && text.length > (description_text || '').length) {
+                            description_html = html;
+                            description_text = text;
                         }
                     }
 
-                    // Meta block for Durban / Salary / Job Type / Sectors / Reference / Job ID
+                    // Meta block for Durban / Salary / Job Type / Sectors / Job ID
                     const summaryMeta = extractMetaFromSummary($);
                     if (!data.location && summaryMeta.location) {
                         data.location = summaryMeta.location;
@@ -516,12 +557,14 @@ await Actor.main(async () => {
                     if (!data.employment_type && summaryMeta.employment_type) {
                         data.employment_type = summaryMeta.employment_type;
                     }
-                    if (summaryMeta.sectors) {
-                        data.sectors = summaryMeta.sectors;
+
+                    // sectors: summary -> scripts(job_sector)
+                    let sectors = summaryMeta.sectors || null;
+                    if (!sectors) {
+                        sectors = extractSectorsFromScripts($) || null;
                     }
-                    if (summaryMeta.reference) {
-                        data.reference = summaryMeta.reference;
-                    }
+                    data.sectors = sectors;
+
                     let jobIdMeta = summaryMeta.job_id || null;
 
                     // Fallbacks directly from selectors
@@ -561,15 +604,14 @@ await Actor.main(async () => {
                         data.date_posted = dateText || null;
                     }
 
-                    // Company description - clean text only
+                    // Company description - clean text textual-only
                     let company_description = null;
-                    const companyDescEl = $(
+                    const companyRoot = $(
                         '.company-description, .about-company, #company-profile, .about-company-section, .company-profile',
                     ).first();
-                    if (companyDescEl && companyDescEl.length) {
-                        company_description = cleanText(
-                            companyDescEl.html() || companyDescEl.text(),
-                        );
+                    if (companyRoot && companyRoot.length) {
+                        const { text } = extractTextualContent($, companyRoot);
+                        company_description = text || null;
                     }
 
                     // Job ID: meta -> URL
@@ -587,12 +629,11 @@ await Actor.main(async () => {
                         date_posted: normalizeText(data.date_posted),
                         valid_through: normalizeText(data.valid_through),
                         sectors: normalizeText(data.sectors),
-                        reference: normalizeText(data.reference),
                         job_id: normalizeText(job_id),
                     };
 
                     const item = {
-                        schema_version: 3,
+                        schema_version: 4,
                         source: 'careers24',
                         scraped_at: new Date().toISOString(),
 
@@ -604,15 +645,18 @@ await Actor.main(async () => {
                         date_posted: normalized.date_posted,
                         valid_through: normalized.valid_through,
 
-                        // Sectors and job ID
-                        sectors: normalized.sectors || sectorFromInput || null,
+                        // single ID column
                         job_id: normalized.job_id || null,
-                        reference: normalized.reference || normalized.job_id || null,
+
+                        // sectors (page -> input)
+                        sectors: normalized.sectors || sectorFromInput || null,
 
                         // Descriptions
-                        description_text: data.description_text || null,
-                        job_description: data.description_text || null, // alias
-                        company_description: company_description || null, // clean text only
+                        description_html: description_html || null,
+                        description_text: description_text || null,
+                        job_description: description_text || null, // alias
+
+                        company_description: company_description || null,
 
                         url: request.url,
                     };
