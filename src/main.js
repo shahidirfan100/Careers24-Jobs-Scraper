@@ -358,28 +358,83 @@ function extractJobIdFromUrl(jobUrl) {
     }
 }
 
-// Heuristic: detect generic Careers24 text and avoid using it as company_description.
-const isProbablyGenericCareers24Text = (text, companyName) => {
-    if (!text) return true; // treat empty as "not valid"
+// ── Company description extraction ─────────────────────────────
+// Rules:
+// - Prefer .c24-vacancy-details-contents
+// - Only accept if:
+//     * length >= 80 chars AND
+//     * EITHER contains companyName
+//       OR contains no "careers24" / job-board CTAs.
+// - Optional fallback: a heading "About {company}" where heading text includes companyName.
+// - Otherwise return null (keep column empty).
+const extractCompanyDescription = ($, companyNameRaw) => {
+    const companyName = (companyNameRaw || '').trim();
+    const companyLower = companyName.toLowerCase();
+    const isCompanyMentioned = (text) =>
+        companyLower && text.toLowerCase().includes(companyLower);
 
-    const t = text.toLowerCase().trim();
-    const len = t.length;
-    const companyLower = (companyName || '').toLowerCase().trim();
+    const looksLikeGenericCareers24 = (text) => {
+        const t = text.toLowerCase();
+        if (t.length < 80) return true; // too short to be a proper profile
 
-    // Very short text is likely not a real company profile
-    if (len < 60) return true;
+        const mentionsCareers24 = t.includes('careers24');
+        const genericCtas = [
+            'browse jobs',
+            'search for jobs',
+            'upload your cv',
+            'post your cv',
+            'post your resume',
+            'get job alerts',
+        ];
+        if (genericCtas.some((p) => t.includes(p))) return true;
 
-    // If text heavily mentions Careers24 but not the company name, it's likely generic Careers24 copy
-    const mentionsCareers24 = t.includes('careers24');
-    const mentionsCompany = companyLower && t.includes(companyLower);
+        // If it mentions Careers24 but not the company name, treat as generic
+        if (mentionsCareers24 && (!companyLower || !t.includes(companyLower))) return true;
 
-    if (mentionsCareers24 && !mentionsCompany) return true;
+        return false;
+    };
 
-    // Generic phrases we want to avoid
-    if (t.includes('browse jobs') || t.includes('search for jobs')) return true;
-    if (t.includes('post your cv') || t.includes('cv upload')) return true;
+    // 1) Primary: dedicated company description container
+    let root = $('.c24-vacancy-details-contents').first();
+    if (root && root.length) {
+        const { text } = extractSanitizedContent(root.html() || '');
+        if (text) {
+            const trimmed = text.trim();
+            if (!looksLikeGenericCareers24(trimmed)) {
+                // If a company name is known, prefer that it's mentioned
+                if (!companyLower || isCompanyMentioned(trimmed) || trimmed.length > 150) {
+                    return trimmed;
+                }
+            }
+        }
+    }
 
-    return false;
+    // 2) Fallback: explicit "About {Company}" heading
+    if (companyLower) {
+        const aboutHeading = $('h1, h2, h3')
+            .filter((_, el) => {
+                const h = $(el).text().trim().toLowerCase();
+                return h.startsWith('about') && h.includes(companyLower);
+            })
+            .first();
+
+        if (aboutHeading && aboutHeading.length) {
+            const container =
+                aboutHeading.closest('section, div, article') || aboutHeading.parent();
+            if (container && container.length) {
+                const { text } = extractSanitizedContent(container.html() || '');
+                if (text) {
+                    const trimmed = text.trim();
+                    if (!looksLikeGenericCareers24(trimmed) && isCompanyMentioned(trimmed)) {
+                        return trimmed;
+                    }
+                }
+            }
+        }
+    }
+
+    // If nothing passes the checks, keep it empty
+    return null;
 };
 
 // ───────────────────────────────────────────────────────────────
@@ -701,38 +756,8 @@ await Actor.main(async () => {
                         data.date_posted = dateText || null;
                     }
 
-                    // ── Company description: .c24-vacancy-details-contents then "About ..." ─────
-                    let company_description = null;
-                    let companyRoot = $('.c24-vacancy-details-contents').first();
-
-                    if (!companyRoot || !companyRoot.length) {
-                        const aboutHeading = $('h1, h2')
-                            .filter((_, el) => {
-                                const t = $(el).text().trim().toLowerCase();
-                                return t.startsWith('about ');
-                            })
-                            .first();
-                        if (aboutHeading && aboutHeading.length) {
-                            companyRoot = aboutHeading.closest('section, div, article');
-                            if (!companyRoot || !companyRoot.length) {
-                                companyRoot = aboutHeading.parent();
-                            }
-                        }
-                    }
-
-                    if (companyRoot && companyRoot.length) {
-                        const { text } = extractSanitizedContent(companyRoot.html() || '');
-                        company_description = text || null;
-                    }
-
-                    // Apply heuristic: if text looks generic Careers24 (not about company), drop it
-                    if (company_description) {
-                        const companyNameForCheck =
-                            data.company || $('title').first().text().split('at ')[1] || '';
-                        if (isProbablyGenericCareers24Text(company_description, companyNameForCheck)) {
-                            company_description = null;
-                        }
-                    }
+                    // ── Company description (strict) ─────────────────────
+                    const company_description = extractCompanyDescription($, data.company);
 
                     // Job ID: meta -> URL
                     const urlJobId = extractJobIdFromUrl(request.url);
@@ -753,7 +778,7 @@ await Actor.main(async () => {
                     };
 
                     const item = {
-                        schema_version: 7,
+                        schema_version: 8,
                         source: 'careers24',
                         scraped_at: new Date().toISOString(),
 
@@ -775,7 +800,8 @@ await Actor.main(async () => {
                         description_html: description_html || null,  // only clean text tags, no attributes
                         description_text: description_text || null,
 
-                        company_description: company_description || null, // clean text only, empty if generic Careers24
+                        // Company info: either a real company profile, or null (never generic Careers24)
+                        company_description: company_description || null,
 
                         url: request.url,
                     };
