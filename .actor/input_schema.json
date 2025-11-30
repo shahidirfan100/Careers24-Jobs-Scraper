@@ -1,0 +1,71 @@
+{
+  "title": "Careers24 Jobs Scraper",
+  "description": "Extract job listings from Careers24.com, South Africa's premier job portal. Search by keyword, location, sector, salary range, and remote preferences. Efficiently scrapes job details including titles, companies, descriptions, salaries, and more.",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "startUrl": {
+      "title": "Start URL",
+      "type": "string",
+      "description": "Start scraping from a specific Careers24 search URL. If provided, this overrides keyword/location/sector settings.",
+      "editor": "textfield",
+      "example": "https://www.careers24.com/jobs/lc-gauteng/rmt-incl/?sort=dateposted"
+    },
+    "keyword": {
+      "title": "Job Keyword",
+      "type": "string",
+      "description": "Search for specific job titles or keywords (e.g., 'Software Developer', 'Accountant', 'Nurse', 'Engineer').",
+      "editor": "textfield",
+      "prefill": "software developer"
+    },
+    "location": {
+      "title": "Location",
+      "type": "string",
+      "description": "Filter by South African location (e.g., 'gauteng', 'western-cape', 'eastern-cape', 'kwazulu-natal'). Leave empty for all locations.",
+      "editor": "textfield",
+      "example": "gauteng"
+    },
+    "remoteOnly": {
+      "title": "Remote Jobs Only",
+      "type": "boolean",
+      "description": "Set to true to show only remote job opportunities. Set to false to include remote jobs in results.",
+      "editor": "checkbox",
+      "default": false
+    },
+    "collectDetails": {
+      "title": "Collect job details",
+      "type": "boolean",
+      "description": "If enabled, scraper visits each job detail page to extract full descriptions and additional information.",
+      "editor": "checkbox",
+      "default": true
+    },
+    "results_wanted": {
+      "title": "Maximum number of jobs",
+      "type": "integer",
+      "description": "Maximum number of job listings to collect. Set a lower number for faster results or higher for comprehensive searches.",
+      "minimum": 1,
+      "default": 100,
+      "editor": "number"
+    },
+    "max_pages": {
+      "title": "Maximum number of pages",
+      "type": "integer",
+      "description": "Safety limit on the number of search result pages to scrape. Prevents excessive crawling.",
+      "minimum": 1,
+      "editor": "number",
+      "default": 20
+    },
+    "proxyConfiguration": {
+      "title": "Proxy configuration",
+      "type": "object",
+      "description": "Configure proxy settings for reliable scraping. Recommended to use Apify Proxy to avoid IP blocks.",
+      "editor": "proxy",
+      "default": {
+        "useApifyProxy": true,
+        "apifyProxyGroups": ["RESIDENTIAL"]
+      }
+    }
+  },
+  "required": [],
+  "additionalProperties": false
+}
